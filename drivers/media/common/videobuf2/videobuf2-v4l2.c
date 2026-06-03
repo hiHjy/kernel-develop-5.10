@@ -352,6 +352,12 @@ static void set_buffer_cache_hints(struct vb2_queue *q,
 				   struct v4l2_buffer *b)
 {
 	/*
+	* DMA 导出器（DMA exporter）应该负责处理缓存同步（cache syncs），
+	* 因此我们可以避免显式的 ->prepare()/->finish() 同步操作。
+	* 对于其他 ->memory 类型，我们总是需要 ->prepare() 或/和 ->finish()
+	* 缓存同步操作。
+	*/
+	/*
 	 * DMA exporter should take care of cache syncs, so we can avoid
 	 * explicit ->prepare()/->finish() syncs. For other ->memory types
 	 * we always need ->prepare() or/and ->finish() cache sync.
@@ -1054,10 +1060,13 @@ EXPORT_SYMBOL_GPL(vb2_ioctl_querybuf);
 
 int vb2_ioctl_qbuf(struct file *file, void *priv, struct v4l2_buffer *p)
 {
+	//file 是内核中的文件对象（struct file *），对应用户空间打开的 /dev/videoX 设备。
+	//本质都是：从 file 中获取对应的 video_device 结构体。
 	struct video_device *vdev = video_devdata(file);
 
 	if (vb2_queue_is_busy(vdev, file))
 		return -EBUSY;
+	//struct v4l2_buffer *p 来自用户空间ioctl VIDIOC_QBUF
 	return vb2_qbuf(vdev->queue, vdev->v4l2_dev->mdev, p);
 }
 EXPORT_SYMBOL_GPL(vb2_ioctl_qbuf);

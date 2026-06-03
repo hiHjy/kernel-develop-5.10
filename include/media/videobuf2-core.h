@@ -252,19 +252,19 @@ struct vb2_buffer {
 	struct media_request	*request;
 	struct media_request_object	req_obj;
 	/* private: 仅内部使用
- *
- * state:		当前缓冲区的状态；不要修改
- * synced:		该缓冲区已为 DMA 同步，即已调用 'prepare' 内存操作。
- *                  在调用 'finish' 内存操作后会再次清除此标志。
- * prepared:		该缓冲区已准备就绪，即已调用 buf_prepare 操作。
- *                  在调用 'buf_finish' 操作后会再次清除此标志。
- * copied_timestamp:	此捕获缓冲区的时间戳已从输出缓冲区复制过来
- * need_cache_sync_on_prepare:	如果设置，缓冲区的 ->prepare() 函数会执行缓存同步/使无效操作
- * need_cache_sync_on_finish:	如果设置，缓冲区的 ->finish() 函数会执行缓存同步/使无效操作
- * queued_entry:	用于挂入已排队缓冲区列表的链表节点，该列表保存所有从用户空间排队的缓冲区
- * done_entry:		用于挂入已完成缓冲区列表的链表节点，该列表保存所有准备被用户空间出队的缓冲区
- * vb2_plane:		各平面的信息；不要修改
- */
+	*
+	* state:		当前缓冲区的状态；不要修改
+	* synced:		该缓冲区已为 DMA 同步，即已调用 'prepare' 内存操作。
+	*                  在调用 'finish' 内存操作后会再次清除此标志。
+	* prepared:		该缓冲区已准备就绪，即已调用 buf_prepare 操作。
+	*                  在调用 'buf_finish' 操作后会再次清除此标志。
+	* copied_timestamp:	此捕获缓冲区的时间戳已从输出缓冲区复制过来
+	* need_cache_sync_on_prepare:	如果设置，缓冲区的 ->prepare() 函数会执行缓存同步/使无效操作
+	* need_cache_sync_on_finish:	如果设置，缓冲区的 ->finish() 函数会执行缓存同步/使无效操作
+	* queued_entry:	用于挂入已排队缓冲区列表的链表节点，该列表保存所有从用户空间排队的缓冲区
+	* done_entry:		用于挂入已完成缓冲区列表的链表节点，该列表保存所有准备被用户空间出队的缓冲区
+	* vb2_plane:		各平面的信息；不要修改
+	*/
 	/* private: internal use only
 	 *
 	 * state:		current buffer state; do not change

@@ -237,7 +237,10 @@ void timer_function (struct timer_list *timer)
 	}
 
 	buf = list_entry(g_queued_bufs.next, struct virtual_frame_buf, list);
+	
+	/* 作用是从一个链表中删除指定的节点，并把它初始化成一个空的独立节点。 */
 	list_del_init(&buf->list);
+	
 	spin_unlock_irqrestore(&g_queued_bufs_lock, flags);
 
 	/*

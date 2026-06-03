@@ -331,6 +331,10 @@ static void __vb2_buf_mem_prepare(struct vb2_buffer *vb)
 			call_void_memop(vb, prepare,
 					vb->planes[plane].mem_priv);
 	}
+	/*
+		synced = 1
+  		表示该 buffer 已经做过内存 prepare。
+  	*/
 	vb->synced = 1;
 }
 
@@ -1355,18 +1359,23 @@ err:
 }
 
 /*
+ * __enqueue_in_driver() - 将 vb2_buffer 入队到驱动中进行处理
+ */
+/*
  * __enqueue_in_driver() - enqueue a vb2_buffer in driver for processing
  */
 static void __enqueue_in_driver(struct vb2_buffer *vb)
 {
 	struct vb2_queue *q = vb->vb2_queue;
 
-	vb->state = VB2_BUF_STATE_ACTIVE;
+	vb->state = VB2_BUF_STATE_ACTIVE;//用户使用的vb的状态是active
+	//owned_by_drv_count++
 	atomic_inc(&q->owned_by_drv_count);
 
 	trace_vb2_buf_queue(q, vb);
 
-	call_void_vb_qop(vb, buf_queue, vb);
+	//q->ops->buf_queue(vb);
+	call_void_vb_qop(vb, buf_queue, vb);//调用驱动的xxx_queue_buf
 }
 
 static int __buf_prepare(struct vb2_buffer *vb)
@@ -1733,6 +1742,12 @@ int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb,
 	 * Add to the queued buffers list, a buffer will stay on it until
 	 * dequeued in dqbuf.
 	 */
+
+	 /*
+	 	buffer 已经被应用层 QBUF
+		buffer 在 vb2 的 q->queued_list
+		state = QUEUED
+	 */
 	orig_state = vb->state;
 	list_add_tail(&vb->queued_entry, &q->queued_list);
 	q->queued_count++;
@@ -1751,8 +1766,8 @@ int vb2_core_qbuf(struct vb2_queue *q, unsigned int index, void *pb,
 	 * If already streaming, give the buffer to driver for processing.
 	 * If not, the buffer will be given to driver on next streamon.
 	 */
-	if (q->start_streaming_called)
-		__enqueue_in_driver(vb);
+	if (q->start_streaming_called) 
+		__enqueue_in_driver(vb);//要将vb提交给用户写的驱动
 
 		/* 为用户空间填充缓冲区信息 */
 	/* Fill buffer information for the userspace */
