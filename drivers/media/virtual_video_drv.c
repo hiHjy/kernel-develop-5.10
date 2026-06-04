@@ -388,6 +388,7 @@ static int virtual_queue_setup(struct vb2_queue *vq,
 	return 0;
 }
 
+
 static void virtual_buf_queue(struct vb2_buffer *vb)
 {
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);

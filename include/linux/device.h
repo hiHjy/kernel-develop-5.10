@@ -365,6 +365,82 @@ struct dev_links_info {
 	enum dl_dev_state status;
 };
 
+
+/**
+ * struct device - 基础设备结构体
+ * @parent:	设备的"父"设备，即它所附着的设备。
+ * 		大多数情况下，父设备是某种总线或主机控制器。
+ * 		如果 parent 为 NULL，则该设备是顶层设备，这通常不是你想要的结果。
+ * @p:		持有设备核心部分的私有数据。
+ * 		详见 struct device_private 的注释。
+ * @kobj:	顶层抽象类，其他类从此派生。
+ * @init_name:	设备的初始名称。
+ * @type:	设备类型。
+ * 		标识设备类型并携带类型特定的信息。
+ * @mutex:	用于同步对其驱动调用的互斥锁。
+ * @lockdep_mutex: 一个可选的调试锁，子系统可以将其作为对等锁，
+ * 		  以获得 device_lock 的局部 lockdep 覆盖。
+ * @bus:	设备所在的总线类型。
+ * @driver:	哪个驱动已分配此设备。
+ * @platform_data: 设备特定的平台数据。
+ * 		例如：对于定制板上的设备，就像典型的嵌入式和基于 SOC 的硬件，
+ *		Linux 通常使用 platform_data 来指向描述设备及其连接方式的板级特定结构。
+ *		这可以包括有哪些端口可用、芯片变体、哪些 GPIO 引脚扮演什么额外角色等。
+ *		这缩小了"板级支持包"（BSP）的规模，并最大限度地减少了驱动中特定于板的 #ifdef。
+ * @driver_data: 驱动特定信息的私有指针。
+ * @links:	指向此设备的供应商和消费者的链接。
+ * @power:	用于设备电源管理。
+ * 		详见 Documentation/driver-api/pm/devices.rst。
+ * @pm_domain:	提供在系统挂起、休眠、系统恢复以及运行时 PM 转换期间执行的回调，
+ * 		以及子系统级别和驱动级别的回调。
+ * @em_pd:	设备的能量模型性能域。
+ * @pins:	用于设备引脚管理。
+ * 		详见 Documentation/driver-api/pinctl.rst。
+ * @msi_list:	存放 MSI 描述符。
+ * @msi_domain: 此设备使用的通用 MSI 域。
+ * @numa_node:	此设备靠近的 NUMA 节点。
+ * @dma_ops:	此设备的 DMA 映射操作。
+ * @dma_mask:	DMA 掩码（如果设备支持 DMA）。
+ * @coherent_dma_mask: 类似于 dma_mask，但用于 alloc_coherent 映射，
+ * 		     因为并非所有硬件都支持 64 位地址用于此类描述符的一致性分配。
+ * @bus_dma_limit: 上游桥接器或总线的限制，它对 DMA 施加的限制
+ * 		  比设备本身支持的更小。
+ * @dma_range_map: DMA 内存范围相对于 RAM 的映射。
+ * @dma_parms:	底层驱动可以设置这些来向 IOMMU 代码告知段限制。
+ * @dma_pools:	DMA 池（如果设备支持 DMA）。
+ * @dma_mem:	内部用于覆盖一致性内存。
+ * @cma_area:	用于 DMA 分配的连续内存区。
+ * @archdata:	用于架构特定的附加内容。
+ * @of_node:	关联的设备树节点。
+ * @fwnode:	由平台固件提供的关联设备节点。
+ * @devt:	用于创建 sysfs "dev"。
+ * @id:		设备实例。
+ * @devres_lock: 保护设备资源的自旋锁。
+ * @devres_head: 设备的资源链表。
+ * @knode_class: 用于将设备添加到类列表的节点。
+ * @class:	设备的类。
+ * @groups:	可选的属性组。
+ * @release:	在所有引用消失后释放设备的回调函数。
+ * 		应由设备的分配者（即发现设备的总线驱动）设置。
+ * @iommu_group: 设备所属的 IOMMU 组。
+ * @iommu:	每个设备的通用 IOMMU 运行时数据。
+ *
+ * @offline_disabled: 如果设置，设备永久在线。
+ * @offline:	成功调用总线类型的 .offline() 后设置。
+ * @of_node_reused: 如果设备树节点与祖先设备共享则设置。
+ * @state_synced: 此设备的硬件状态已通过调用驱动/总线 sync_state()
+ *		  回调与软件状态同步。
+ * @dma_coherent: 此特定设备是 DMA 一致的，即使架构支持非一致设备。
+ * @dma_ops_bypass: 如果设为 %true，则绕过流式 DMA 操作的 dma_ops，
+ *		   并且可选地（如果一致性掩码足够大）也绕过 dma 分配。
+ *		   此标志由 dma_ops 实例通过 ->dma_supported 管理。
+ *
+ * 在最底层，Linux 系统中的每个设备都由一个 struct device 实例表示。
+ * device 结构体包含了设备模型核心建模系统所需的信息。
+ * 然而，大多数子系统会跟踪它们所托管的设备的额外信息。
+ * 因此，设备很少由裸的 device 结构体表示；相反，该结构体（如 kobject 结构体）
+ * 通常嵌入在设备的更高级表示中。
+ */
 /**
  * struct device - The basic device structure
  * @parent:	The device's "parent" device, the device to which it is attached.
