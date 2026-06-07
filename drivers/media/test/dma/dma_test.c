@@ -10,7 +10,7 @@
 #include <linux/string.h>
 
 #define DEVICE_NAME "dma_test"
-#define DMA_SIZE 4096
+#define DMA_SIZE 640 * 480 * 2
 #define DUMP_SIZE 100
 
 struct test_dev {
@@ -34,7 +34,6 @@ struct test_dev {
 	void *dst_cpu_addr;
 	dma_addr_t src_dma_addr;
 	dma_addr_t dst_dma_addr;
-
 	/*
 	 * DMA Engine 通道。
 	 *
@@ -128,6 +127,7 @@ static int dma_test_probe(struct platform_device *pdev)
 	int ret = 0;
 
 	dev_info(&pdev->dev, "probe start\n");
+	dev_info(&pdev->dev, "sizeof(dma_addr_t) = %zu\n", sizeof(dma_addr_t));
 
 	/*
 	 * 申请驱动私有数据。
@@ -163,6 +163,7 @@ static int dma_test_probe(struct platform_device *pdev)
 	 *   这块内存对 CPU 和 DMA 设备保持一致性。
 	 *   对这个入门测试来说，我们不用额外调用 dma_sync_* 做 cache 同步。
 	 */
+	
 	tdev->src_cpu_addr = dma_alloc_coherent(tdev->dev, DMA_SIZE,
 						&tdev->src_dma_addr,
 						GFP_KERNEL);
