@@ -162,8 +162,7 @@ importer 是 buffer 的使用者。
 ```text
 通过 fd 得到 dma_buf
 attach 到自己的 struct device
-map_attachment 得到 sg_table
-把 sg_table 映射成自己设备可用的 DMA 地址
+map_attachment 得到当前设备可用的 DMA 视图 sg_table
 硬件开始处理
 unmap/detach
 ```
@@ -209,6 +208,190 @@ map_attachment 表示：
 
 ```c
 struct sg_table *sgt;
+
+struct sg_table {
+    struct scatterlist *sgl;   // 指向 sg 链表/数组的起始位置
+    unsigned int nents;         // 映射后的有效条目数
+    unsigned int orig_nents;    // 原始分配的条目数（通常 >= nents）
+};
+
+struct scatterlist {
+    unsigned long page_link;    // 指向物理页的指针（编码）
+    unsigned int offset;        // 页内的偏移（字节）
+    unsigned int length;        // 片段长度（字节）
+    dma_addr_t dma_address;     // DMA 使用的地址（映射后填充）
+    // ...
+};
+```
+
+假设要传输 12KB 数据，内存可能分散在 3 个物理页里：
+
+```text
+sg_table
+  |
+  +-- sgl ---> [scatterlist 0] ---> 物理页 A (4KB, offset 0)
+  |            [scatterlist 1] ---> 物理页 B (4KB, offset 0)
+  |            [scatterlist 2] ---> 物理页 C (4KB, offset 0)
+  |
+  +-- nents      = 3
+  +-- orig_nents = 3
+```
+
+DMA 控制器不会关心这 12KB 在 CPU 虚拟地址里看起来是不是连续。
+
+它关心的是：
+
+```text
+第 1 段 DMA 地址 + 长度
+第 2 段 DMA 地址 + 长度
+第 3 段 DMA 地址 + 长度
+```
+
+如果设备挂在 IOMMU 后面，`dma_map_sg()` 或 `dma_map_sgtable()` 还有可能把多个物理上分散的段合并成更少的 DMA 段。
+
+所以要记住：
+
+```text
+orig_nents = 原始 scatterlist 条目数
+nents      = DMA 映射后设备真正看到的有效条目数
+```
+
+常用操作函数：
+
+| 函数 | 作用 |
+| --- | --- |
+| `sg_alloc_table(sgt, nents, GFP_KERNEL)` | 分配能容纳 `nents` 个条目的 `sg_table` |
+| `sg_free_table(sgt)` | 释放 `sg_table` 占用的 scatterlist 内存 |
+| `sg_init_table(sgl, nents)` | 初始化已经分配好的 sg 数组 |
+| `sg_set_page(sg, page, len, offset)` | 设置某个 sg 条目指向一个物理页 |
+| `sg_page(sg)` | 从 sg 条目取回 `struct page *` |
+| `sg_dma_address(sg)` | 取 DMA 映射后的地址 |
+| `sg_dma_len(sg)` | 取 DMA 映射后的长度 |
+| `dma_map_sgtable(dev, sgt, dir, attrs)` | 把整个 `sg_table` 映射给某个设备 DMA 使用 |
+| `dma_unmap_sgtable(dev, sgt, dir, attrs)` | 取消整个 `sg_table` 的 DMA 映射 |
+
+几个容易踩坑的点：
+
+```text
+不要直接改 page_link，要用 sg_set_page() / sg_assign_page()。
+CPU 视角用 sg->length，DMA 视角用 sg_dma_len(sg)。
+DMA 映射成功后，遍历设备可用 DMA 段要按 sgt->nents。
+取消 DMA 映射时，底层仍需要原始条目数，也就是 sgt->orig_nents。
+如果已经拿到 dmabuf 的 map_attachment 返回值，不要再对这个 sgt 重复 dma_map_sgtable()。
+```
+
+一个完整的 `sg_table` 使用示例：
+
+```c
+#include <linux/dma-mapping.h>
+#include <linux/gfp.h>
+#include <linux/mm.h>
+#include <linux/scatterlist.h>
+
+static int demo_sgtable_dma(struct device *dev, struct page **pages,
+			    unsigned int nr_pages)
+{
+	struct sg_table sgt;
+	struct scatterlist *sg;
+	enum dma_data_direction dir = DMA_TO_DEVICE;
+	int ret;
+	int i;
+
+	/*
+	 * 假设 pages[] 里已经放好了 nr_pages 个有效 struct page *。
+	 * 这些 page 可以来自 alloc_page()，也可以来自已经 pin 住的用户页。
+	 */
+	ret = sg_alloc_table(&sgt, nr_pages, GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	for_each_sg(sgt.sgl, sg, sgt.orig_nents, i)
+		sg_set_page(sg, pages[i], PAGE_SIZE, 0);
+
+	ret = dma_map_sgtable(dev, &sgt, dir, 0);
+	if (ret)
+		goto err_free_sgt;
+
+	for_each_sgtable_dma_sg(&sgt, sg, i) {
+		dma_addr_t dma = sg_dma_address(sg);
+		unsigned int len = sg_dma_len(sg);
+
+		/*
+		 * 这里把 dma/len 填进硬件 DMA 描述符。
+		 * 注意：给硬件的是 DMA 地址，不是 CPU 虚拟地址。
+		 */
+		(void)dma;
+		(void)len;
+	}
+
+	/*
+	 * 等硬件 DMA 完成后再 unmap。
+	 * 如果是异步 DMA，这里应该放在中断、回调或任务完成路径里。
+	 */
+	dma_unmap_sgtable(dev, &sgt, dir, 0);
+
+err_free_sgt:
+	sg_free_table(&sgt);
+	return ret;
+}
+```
+
+如果这是 dmabuf importer，完整流程一般长这样：
+
+```c
+#include <linux/dma-buf.h>
+#include <linux/dma-direction.h>
+#include <linux/err.h>
+#include <linux/scatterlist.h>
+
+static int demo_import_dmabuf_fd(struct device *dev, int fd)
+{
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+	struct scatterlist *sg;
+	enum dma_data_direction dir = DMA_BIDIRECTIONAL;
+	int ret = 0;
+	int i;
+
+	dmabuf = dma_buf_get(fd);
+	if (IS_ERR(dmabuf))
+		return PTR_ERR(dmabuf);
+
+	attach = dma_buf_attach(dmabuf, dev);
+	if (IS_ERR(attach)) {
+		ret = PTR_ERR(attach);
+		goto err_put;
+	}
+
+	sgt = dma_buf_map_attachment(attach, dir);
+	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt);
+		goto err_detach;
+	}
+
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		dma_addr_t dma = sg_dma_address(sg);
+		unsigned int len = sg_dma_len(sg);
+
+		/*
+		 * 把 dma/len 填给当前 importer 设备的硬件描述符。
+		 */
+		(void)dma;
+		(void)len;
+	}
+
+	/*
+	 * 等硬件不再访问这块 buffer 后，按相反顺序释放。
+	 */
+	dma_buf_unmap_attachment(attach, sgt, dir);
+
+err_detach:
+	dma_buf_detach(dmabuf, attach);
+err_put:
+	dma_buf_put(dmabuf);
+	return ret;
+}
 ```
 
 真实硬件最后通常不是拿 fd 工作，而是拿 sg table / DMA address 工作。
