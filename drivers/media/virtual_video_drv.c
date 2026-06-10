@@ -9,7 +9,16 @@
 #include <media/videobuf2-vmalloc.h>
 #include <linux/jiffies.h>
 #include <linux/vmalloc.h>
-
+#include <linux/dma-mapping.h>
+#include <linux/dmaengine.h>
+#include <linux/jiffies.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/printk.h>
+#include <linux/string.h>
+#include <linux/slab.h>
+#include <linux/dma-mapping.h>
 #define VIRTUAL_WIDTH		800
 #define VIRTUAL_HEIGHT		600
 #define VIRTUAL_BPP		2
@@ -46,7 +55,12 @@ static struct list_head g_queued_bufs;
 static spinlock_t g_queued_bufs_lock;
 
 /* 三帧不同颜色的 YUYV 测试图，循环输出。 */
-static unsigned char *g_test_frames[VIRTUAL_FRAME_NUM];
+typedef struct g_test_frame {
+	unsigned char *cpu_addr;
+	dma_addr_t dma_addr;
+}g_test_frame;
+g_test_frame g_test_frames[VIRTUAL_FRAME_NUM];
+//static unsigned char *g_test_frames[VIRTUAL_FRAME_NUM];
 static int g_frame_index = 0;
 
 /*
@@ -214,7 +228,7 @@ void timer_function (struct timer_list *timer)
 {	
 	struct virtual_frame_buf *buf;
 	void* ptr;
-	unsigned char *img = g_test_frames[g_frame_index++];
+	unsigned char *img = g_test_frames[g_frame_index].cpu_addr;
 	unsigned long flags;
 
 	/*
@@ -282,12 +296,18 @@ static int init_test_frames(void)
 	int i;
 
 	/* vmalloc 适合分配较大的连续虚拟地址内存；每帧 800*600*2 字节。 */
-	for (i = 0; i < VIRTUAL_FRAME_NUM; i++) {
-		g_test_frames[i] = vmalloc(VIRTUAL_FRAME_SIZE);
-		if (!g_test_frames[i])
+	// for (i = 0; i < VIRTUAL_FRAME_NUM; i++) {
+	// 	g_test_frames[i] = vmalloc(VIRTUAL_FRAME_SIZE);
+	// 	if (!g_test_frames[i])
+	// 		goto err;
+	// }
+	for (i = 0; i < VIRTUAL_FRAME_NUM; ++i) {
+		g_test_frames[i].cpu_addr = dma_alloc_coherent(NULL, VIRTUAL_FRAME_SIZE, &g_test_frames[i].dma_addr, GFP_KERNEL);
+		if (!g_test_frames[i].cpu_addr)
 			goto err;
 	}
 
+	
 	/*
 	 * 这里填三种不同 YUV 值的纯色帧：
 	 *   第 0 帧偏红
@@ -295,9 +315,9 @@ static int init_test_frames(void)
 	 *   第 2 帧偏蓝/亮色
 	 * 这样抓视频时能确认帧在变化，而不是一直重复一帧。
 	 */
-	fill_yuyv_frame(g_test_frames[0], 76, 84, 255);
-	fill_yuyv_frame(g_test_frames[1], 150, 44, 21);
-	fill_yuyv_frame(g_test_frames[2], 29, 255, 107);
+	fill_yuyv_frame(g_test_frames[0].cpu_addr, 76, 84, 255);
+	fill_yuyv_frame(g_test_frames[1].cpu_addr, 150, 44, 21);
+	fill_yuyv_frame(g_test_frames[2].cpu_addr, 29, 255, 107);
 
 	g_frame_index = 0;
 	return 0;
@@ -305,8 +325,8 @@ static int init_test_frames(void)
 err:
 	/* 如果中途分配失败，只释放已经成功分配的帧。 */
 	while (--i >= 0) {
-		vfree(g_test_frames[i]);
-		g_test_frames[i] = NULL;
+		dma_free_coherent(NULL, VIRTUAL_FRAME_SIZE, g_test_frames[i].cpu_addr, g_test_frames[i].dma_addr);
+		g_test_frames[i].cpu_addr = NULL;
 	}
 
 	return -ENOMEM;
@@ -492,7 +512,7 @@ static int __init virtual_video_drv_init(void)
 	 * 适合这种简单虚拟驱动学习使用。
 	 */
 	g_vb_queue.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	g_vb_queue.io_modes = VB2_MMAP | VB2_USERPTR | VB2_DMABUF | VB2_READ;
+	g_vb_queue.io_modes = VB2_MMAP |  VB2_DMABUF | VB2_READ;
 	g_vb_queue.buf_struct_size = sizeof(struct virtual_frame_buf);
 	g_vb_queue.ops = &virtual_video_vb2_ops;
 	g_vb_queue.mem_ops = &vb2_vmalloc_memops;
