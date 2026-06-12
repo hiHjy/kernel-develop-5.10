@@ -186,32 +186,56 @@ static int virtual_init_test_frames(struct virtual_video_dev *vvd)
 {
 	int i;
 
-	for (i = 0; i < VIRTUAL_FRAME_NUM; i++) {
-		vvd->test_frames[i].cpu_addr =
-			dma_alloc_coherent(vvd->dev, VIRTUAL_FRAME_SIZE,
-					   &vvd->test_frames[i].dma_addr,
-					   GFP_KERNEL);
-		if (!vvd->test_frames[i].cpu_addr)
-			goto err;
+	// for (i = 0; i < VIRTUAL_FRAME_NUM; i++) {
+	// 	vvd->test_frames[i].cpu_addr =
+	// 		dma_alloc_coherent(vvd->dev, VIRTUAL_FRAME_SIZE,
+	// 				   &vvd->test_frames[i].dma_addr,
+	// 				   GFP_KERNEL);
+	// 	if (!vvd->test_frames[i].cpu_addr)
+	// 		goto err;
+	// }
+
+	for (i = 0; i < VIRTUAL_FRAME_NUM; ++i) {
+		vvd->test_frames[i].cpu_addr = kmalloc(VIRTUAL_FRAME_SIZE, GFP_KERNEL);
+		if (vvd->test_frames[i].cpu_addr == NULL) {
+			 dev_err(vvd->dev, "dma_map_single failed for frame %d\n", i);
+			 goto err_unmap;
+		}
+		if (i == 0) {
+			fill_yuyv_frame(vvd->test_frames[i].cpu_addr, 76, 84, 255);
+		} else if (i == 1) {
+			fill_yuyv_frame(vvd->test_frames[i].cpu_addr, 150, 44, 21);
+		} else if (i == 2) {
+			fill_yuyv_frame(vvd->test_frames[i].cpu_addr, 29, 255, 107);
+
+		}
+		vvd->test_frames[i].dma_addr =dma_map_single(vvd->dev, vvd->test_frames[i].cpu_addr, VIRTUAL_FRAME_SIZE, DMA_TO_DEVICE);
+		if (dma_mapping_error(vvd->dev, vvd->test_frames[i].dma_addr)) {
+		dev_err(vvd->dev, "dma_map_single failed for frame %d\n", i);
+			kfree(vvd->test_frames[i].cpu_addr);
+			vvd->test_frames[i].cpu_addr = NULL;
+			// 需要回滚之前已映射成功的帧
+		goto err_unmap;
+}
 	}
 
-	fill_yuyv_frame(vvd->test_frames[0].cpu_addr, 76, 84, 255);
-	fill_yuyv_frame(vvd->test_frames[1].cpu_addr, 150, 44, 21);
-	fill_yuyv_frame(vvd->test_frames[2].cpu_addr, 29, 255, 107);
-
+	
 	for (i = 0; i < VIRTUAL_FRAME_NUM; i++)
-		dev_info(vvd->dev, "test frame[%d]: cpu=%p dma=%pad\n",
+		dev_info(vvd->dev, "test frame[%d]: cpu=%p streaming dma=%pad\n",
 			 i, vvd->test_frames[i].cpu_addr,
 			 &vvd->test_frames[i].dma_addr);
 
 	vvd->frame_index = 0;
 	return 0;
 
-err:
+err_unmap:
 	while (--i >= 0) {
-		dma_free_coherent(vvd->dev, VIRTUAL_FRAME_SIZE,
-				  vvd->test_frames[i].cpu_addr,
-				  vvd->test_frames[i].dma_addr);
+		// dma_free_coherent(vvd->dev, VIRTUAL_FRAME_SIZE,
+		// 		  vvd->test_frames[i].cpu_addr,
+		// 		  vvd->test_frames[i].dma_addr);
+		
+		dma_unmap_single(vvd->dev, vvd->test_frames[i].dma_addr, VIRTUAL_FRAME_SIZE, DMA_TO_DEVICE);
+		kfree(vvd->test_frames[i].cpu_addr);
 		vvd->test_frames[i].cpu_addr = NULL;
 		vvd->test_frames[i].dma_addr = 0;
 	}
@@ -225,9 +249,9 @@ static void virtual_free_test_frames(struct virtual_video_dev *vvd)
 	for (i = 0; i < VIRTUAL_FRAME_NUM; i++) {
 		if (!vvd->test_frames[i].cpu_addr)
 			continue;
-		dma_free_coherent(vvd->dev, VIRTUAL_FRAME_SIZE,
-				  vvd->test_frames[i].cpu_addr,
-				  vvd->test_frames[i].dma_addr);
+		dma_unmap_single(vvd->dev, vvd->test_frames[i].dma_addr,
+				  VIRTUAL_FRAME_SIZE, DMA_TO_DEVICE);
+		kfree(vvd->test_frames[i].cpu_addr);
 		vvd->test_frames[i].cpu_addr = NULL;
 		vvd->test_frames[i].dma_addr = 0;
 	}
@@ -238,19 +262,19 @@ static struct dma_chan *virtual_request_dma_chan(struct virtual_video_dev *vvd)
 	dma_cap_mask_t mask;
 	struct dma_chan *chan;
 
-	chan = dma_request_chan(vvd->dev, "memcpy");
-	if (!IS_ERR(chan))
-		return chan;
+	// chan = dma_request_chan(vvd->dev, "memcpy");
+	// if (!IS_ERR(chan))
+	// 	return chan;
 
-	dev_info(vvd->dev, "dma_request_chan(\"memcpy\") failed: %ld, fallback to any DMA_MEMCPY channel\n",
-		 PTR_ERR(chan));
+	// dev_info(vvd->dev, "dma_request_chan(\"memcpy\") failed: %ld, fallback to any DMA_MEMCPY channel\n",
+	// 	 PTR_ERR(chan));
 
 	dma_cap_zero(mask);
 	dma_cap_set(DMA_MEMCPY, mask);
 	chan = dma_request_channel(mask, NULL, NULL);
 	if (!chan)
 		return ERR_PTR(-ENODEV);
-
+	dev_info(vvd->dev, "virtual_request_dma_chan successful\n");
 	return chan;
 }
 
