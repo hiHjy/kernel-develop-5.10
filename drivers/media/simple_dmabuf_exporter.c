@@ -30,11 +30,64 @@
  * fence 是 dmabuf 生态里的同步机制，常用于 GPU/DRM/显示/多硬件流水线。
  * 你现在先把 exporter、fd、mmap、release 生命周期跑通，后面真正做
  * 多硬件异步同步时再学 fence，会清楚很多。
+ *
+ * 从“谁调用谁”的角度看，这个文件分成三条线：
+ *
+ *   A. 应用层申请 dmabuf：
+ *
+ *      open("/dev/simple_dmabuf_exporter")
+ *        -> simple_dmabuf_open()
+ *
+ *      ioctl(SIMPLE_DMABUF_IOC_EXPORT)
+ *        -> simple_dmabuf_ioctl()
+ *        -> simple_dmabuf_export_one()
+ *        -> dma_alloc_coherent()
+ *        -> dma_buf_export()
+ *        -> dma_buf_fd()
+ *
+ *      返回给应用层的是 dmabuf fd，不是物理地址，也不是 dma_addr。
+ *
+ *   B. 应用层 CPU 访问 dmabuf：
+ *
+ *      mmap(dmabuf_fd)
+ *        -> dma_buf_mmap()
+ *        -> simple_dmabuf_mmap()
+ *        -> dma_mmap_coherent()
+ *
+ *      ioctl(dmabuf_fd, DMA_BUF_IOCTL_SYNC, START/END)
+ *        -> dma_buf_begin_cpu_access() / dma_buf_end_cpu_access()
+ *        -> simple_dmabuf_begin_cpu_access() / simple_dmabuf_end_cpu_access()
+ *
+ *      这版底层用 coherent 内存，所以 begin/end 只打印日志。
+ *      如果以后换成 streaming/cacheable 内存，end_cpu_access(WRITE)
+ *      就是你补 sync_for_device 的关键位置。
+ *
+ *   C. 另一个内核驱动作为 importer 给硬件用：
+ *
+ *      dmabuf = dma_buf_get(fd)
+ *      attach = dma_buf_attach(dmabuf, importer_dev)
+ *        -> simple_dmabuf_attach()
+ *
+ *      sgt = dma_buf_map_attachment(attach, DMA_TO_DEVICE/FROM_DEVICE)
+ *        -> simple_dmabuf_map_dma_buf()
+ *
+ *      importer 从 sgt 里取 DMA 地址，配置给自己的硬件。
+ *
+ *      用完：
+ *      dma_buf_unmap_attachment()
+ *        -> simple_dmabuf_unmap_dma_buf()
+ *      dma_buf_detach()
+ *        -> simple_dmabuf_detach()
+ *      dma_buf_put()
  */
 
 #define DEVICE_NAME "simple_dmabuf_exporter"
 #define DUMP_SIZE 100
 
+struct simple_dmabuf_export_arg {
+	__u32 size;
+	__s32 fd;
+};
 #define SIMPLE_DMABUF_IOC_MAGIC 'b'
 #define SIMPLE_DMABUF_IOC_EXPORT \
 	_IOWR(SIMPLE_DMABUF_IOC_MAGIC, 1, struct simple_dmabuf_export_arg)
@@ -61,10 +114,7 @@
  *   ptr = mmap(NULL, arg.size, PROT_READ | PROT_WRITE,
  *              MAP_SHARED, dmabuf_fd, 0);
  */
-struct simple_dmabuf_export_arg {
-	__u32 size;
-	__s32 fd;
-};
+
 
 struct simple_dmabuf_dev {
 	struct device *dev;
@@ -72,6 +122,9 @@ struct simple_dmabuf_dev {
 	struct mutex lock;
 
 	/*
+	 * 这是“exporter 设备对象”，对应 /dev/simple_dmabuf_exporter。
+	 * 它本身不等于某个 buffer，只是负责响应 ioctl 并创建 buffer。
+	 *
 	 * 教学调试用：
 	 *
 	 * 保存最近一次导出的 buffer，方便 ioctl DUMP 打印。
@@ -84,11 +137,25 @@ struct simple_dmabuf_buffer {
 	struct device *dev;
 	struct mutex lock;
 
+	/*
+	 * backing storage：真正承载数据的内存。
+	 *
+	 * cpu_addr 给 CPU 用，比如内核 memset、dump，或者 mmap 后用户态访问。
+	 * dma_addr 给设备/DMA 控制器用，比如 importer 的硬件读写。
+	 *
+	 * 这版用 dma_alloc_coherent()，所以 CPU 和设备之间不需要手动
+	 * dma_sync_*。如果你以后把它换成 kmalloc + dma_map_single，
+	 * begin/end_cpu_access 和 map/unmap_dma_buf 就要认真处理 cache。
+	 */
 	void *cpu_addr;
 	dma_addr_t dma_addr;
 	size_t size;
 
 	/*
+	 * 这个结构体挂在 dmabuf->priv 上。
+	 * 也就是说，dmabuf 框架回调进来的时候，exporter 可以通过
+	 * dmabuf->priv 找回自己真正的 buffer 对象。
+	 *
 	 * release 只应该执行一次。
 	 * buffer 真正生命周期由 dmabuf fd 引用计数决定。
 	 */
@@ -183,10 +250,35 @@ simple_dmabuf_map_dma_buf(struct dma_buf_attachment *attach,
 	if (ret)
 		goto err_free_sgt;
 
+	/*
+	 * sg_table 是 exporter 交给 importer 的“这块 buffer 在 DMA
+	 * 世界里长什么样”的描述。
+	 *
+	 * 简化版只做 1 个 sg entry：
+	 *
+	 *   sgt->sgl
+	 *     page/offset/length  描述 backing page
+	 *     dma_address/dma_len 描述 importer 可用于 DMA 的地址和长度
+	 *
+	 * importer 驱动一般不会直接碰 buf->dma_addr，而是拿这里返回的
+	 * sg_table，再从 sg_dma_address(sg) 取地址配置给自己的硬件。
+	 */
 	sg_dma_address(sgt->sgl) = buf->dma_addr;
 	sg_dma_len(sgt->sgl) = buf->size;
 	sg_set_page(sgt->sgl, virt_to_page(buf->cpu_addr), buf->size, 0);
 
+	/*
+	 * 这一步把 sg_table 映射到 attach->dev 这个 importer 设备的
+	 * DMA 地址空间。
+	 *
+	 * 对没有 IOMMU、地址空间很直接的平台，你可能觉得 dma 地址
+	 * 没变化；但在有 IOMMU/SMMU 或 DMA mask 限制时，这一步非常关键。
+	 *
+	 * direction 表示 importer 设备接下来怎么访问：
+	 *   DMA_TO_DEVICE   CPU/exporter 写好，importer 设备读
+	 *   DMA_FROM_DEVICE importer 设备写，之后 CPU/exporter 读
+	 *   DMA_BIDIRECTIONAL 双向
+	 */
 	ret = dma_map_sg_attrs(attach->dev, sgt->sgl, sgt->nents, direction, 0);
 	if (!ret) {
 		ret = -ENOMEM;
@@ -219,6 +311,12 @@ static void simple_dmabuf_unmap_dma_buf(struct dma_buf_attachment *attach,
 	dev_info(buf->dev, "unmap_dma_buf: importer dev=%s dir=%d\n",
 		 dev_name(attach->dev), direction);
 
+	/*
+	 * importer 设备用完 DMA 地址后，必须 unmap。
+	 * 这和 streaming DMA 里的 dma_map_single/dma_unmap_single 是一组
+	 * 类似的生命周期概念，只是 dmabuf 这里以 attachment/sg_table
+	 * 为单位。
+	 */
 	dma_unmap_sg_attrs(attach->dev, sgt->sgl, sgt->nents, direction, 0);
 	sg_free_table(sgt);
 	kfree(sgt);
@@ -261,6 +359,16 @@ static int simple_dmabuf_begin_cpu_access(struct dma_buf *dmabuf,
 {
 	struct simple_dmabuf_buffer *buf = dmabuf->priv;
 
+	/*
+	 * 调用语义：
+	 *   CPU 要开始访问这个 dmabuf 了。
+	 *
+	 * 如果 direction 是 DMA_FROM_DEVICE，常见含义是：
+	 *   设备刚写完，CPU 准备读，所以 exporter 应该让 CPU 看到新数据。
+	 *
+	 * 对 streaming/cacheable backing storage 来说，这里通常对应
+	 * sync_for_cpu/invalidate cache。
+	 */
 	dev_info(buf->dev, "begin_cpu_access: dir=%d\n", direction);
 	return 0;
 }
@@ -270,6 +378,17 @@ static int simple_dmabuf_end_cpu_access(struct dma_buf *dmabuf,
 {
 	struct simple_dmabuf_buffer *buf = dmabuf->priv;
 
+	/*
+	 * 调用语义：
+	 *   CPU 访问结束，buffer 可能要重新交给设备。
+	 *
+	 * 如果 direction 是 DMA_TO_DEVICE，常见含义是：
+	 *   CPU 刚写完，设备准备读，所以 exporter 应该把 CPU cache
+	 *   里的新数据刷到设备可见的位置。
+	 *
+	 * 你之前 USB 摄像头 CPU 拷贝后给 RGA/MPP 读，靠
+	 * DMA_BUF_IOCTL_SYNC END WRITE 解决花屏，本质就落在这个语义上。
+	 */
 	dev_info(buf->dev, "end_cpu_access: dir=%d\n", direction);
 	return 0;
 }
@@ -324,6 +443,12 @@ static int simple_dmabuf_export_one(struct simple_dmabuf_dev *sdev,
 	if (!size)
 		return -EINVAL;
 
+	/*
+	 * 1. 先创建 exporter 自己的 buffer 对象。
+	 *
+	 * 注意，这还不是 struct dma_buf。
+	 * simple_dmabuf_buffer 是这个教学驱动自己的私有结构。
+	 */
 	buf = kzalloc(sizeof(*buf), GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
@@ -332,6 +457,17 @@ static int simple_dmabuf_export_one(struct simple_dmabuf_dev *sdev,
 	buf->size = PAGE_ALIGN(size);
 	mutex_init(&buf->lock);
 
+	/*
+	 * 2. 分配真正的 DMA backing storage。
+	 *
+	 * coherent 版本的优点是最容易跑通：
+	 *   CPU 可以通过 cpu_addr 访问
+	 *   设备可以通过 dma_addr 访问
+	 *   begin/end_cpu_access 不需要真的刷 cache
+	 *
+	 * 它适合教学和小块共享内存。视频大帧/生产链路通常会进一步看
+	 * CMA、dma-heap、vb2、ION 或者设备专用 allocator。
+	 */
 	buf->cpu_addr = dma_alloc_coherent(buf->dev, buf->size,
 					   &buf->dma_addr, GFP_KERNEL);
 	if (!buf->cpu_addr) {
@@ -341,11 +477,25 @@ static int simple_dmabuf_export_one(struct simple_dmabuf_dev *sdev,
 
 	memset(buf->cpu_addr, 0x00, buf->size);
 
+	/*
+	 * 3. 准备 dma_buf_export_info。
+	 *
+	 * ops  决定外界 mmap、attach、map、sync、release 时回调谁。
+	 * size 是 dmabuf 对外暴露的大小。
+	 * priv 是 exporter 私有指针，后续所有 dma_buf_ops 都靠
+	 *      dmabuf->priv 找回 simple_dmabuf_buffer。
+	 */
 	exp_info.ops = &simple_dmabuf_ops;
 	exp_info.size = buf->size;
 	exp_info.flags = O_RDWR;
 	exp_info.priv = buf;
 
+	/*
+	 * 4. 创建 struct dma_buf。
+	 *
+	 * 到这里 buffer 已经进入 dma-buf 框架，有了引用计数和 ops，
+	 * 但用户态还拿不到它，因为还没有 fd。
+	 */
 	dmabuf = dma_buf_export(&exp_info);
 	if (IS_ERR(dmabuf)) {
 		dma_free_coherent(buf->dev, buf->size, buf->cpu_addr,
@@ -354,6 +504,15 @@ static int simple_dmabuf_export_one(struct simple_dmabuf_dev *sdev,
 		return PTR_ERR(dmabuf);
 	}
 
+	/*
+	 * 5. 把 struct dma_buf 安装成当前进程的 fd。
+	 *
+	 * 这个 fd 可以：
+	 *   mmap()
+	 *   close()
+	 *   传给别的进程
+	 *   传给 RGA/DRM/V4L2/MPP 等 importer
+	 */
 	fd = dma_buf_fd(dmabuf, O_CLOEXEC);
 	if (fd < 0) {
 		/*
@@ -364,6 +523,14 @@ static int simple_dmabuf_export_one(struct simple_dmabuf_dev *sdev,
 		return fd;
 	}
 
+	/*
+	 * 6. 教学调试：额外保存最近一次导出的 dmabuf。
+	 *
+	 * get_dma_buf() 是增加引用。这样即使用户态暂时 close(fd)，
+	 * 只要 last_dmabuf 还持有引用，DUMP 仍然能看到它。
+	 *
+	 * remove() 或下一次 export 时会 dma_buf_put() 放掉这个引用。
+	 */
 	mutex_lock(&sdev->lock);
 	if (sdev->last_dmabuf)
 		dma_buf_put(sdev->last_dmabuf);
@@ -409,6 +576,13 @@ static long simple_dmabuf_ioctl(struct file *filp, unsigned int cmd,
 
 	switch (cmd) {
 	case SIMPLE_DMABUF_IOC_EXPORT:
+		/*
+		 * 应用层从 misc 设备 fd 请求“帮我导出一块 dmabuf”。
+		 *
+		 * 这里有两个 fd：
+		 *   filp 对应 /dev/simple_dmabuf_exporter，是控制 fd。
+		 *   export_arg.fd 是返回给应用层的 dmabuf fd，是数据 fd。
+		 */
 		if (copy_from_user(&export_arg, (void __user *)arg,
 				   sizeof(export_arg)))
 			return -EFAULT;
@@ -432,6 +606,13 @@ static long simple_dmabuf_ioctl(struct file *filp, unsigned int cmd,
 		break;
 
 	case SIMPLE_DMABUF_IOC_DUMP:
+		/*
+		 * DUMP 只是教学调试接口，用来证明：
+		 *   用户态 mmap 写入 dmabuf 后，exporter 的 cpu_addr
+		 *   能看到同一块 backing storage 的内容。
+		 *
+		 * 它不是 dmabuf 标准接口，真实 importer 不靠这个拿数据。
+		 */
 		mutex_lock(&sdev->lock);
 		dmabuf = sdev->last_dmabuf;
 		if (dmabuf)
@@ -460,6 +641,7 @@ static const struct file_operations simple_dmabuf_fops = {
 	.release = simple_dmabuf_release_file,
 	.unlocked_ioctl = simple_dmabuf_ioctl,
 };
+
 
 static int simple_dmabuf_probe(struct platform_device *pdev)
 {
