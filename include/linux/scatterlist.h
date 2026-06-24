@@ -9,9 +9,9 @@
 #include <asm/io.h>
 
 struct scatterlist {
-	unsigned long	page_link;
-	unsigned int	offset;
-	unsigned int	length;
+	unsigned long	page_link;//这段内存位于哪个 struct page
+	unsigned int	offset;//从 page 内哪个 offset 开始
+	unsigned int	length;//长度
 	dma_addr_t	dma_address;
 #ifdef CONFIG_NEED_SG_DMA_LENGTH
 	unsigned int	dma_length;

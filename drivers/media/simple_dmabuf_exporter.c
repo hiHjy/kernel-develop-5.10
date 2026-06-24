@@ -71,7 +71,8 @@
  *      sgt = dma_buf_map_attachment(attach, DMA_TO_DEVICE/FROM_DEVICE)
  *        -> simple_dmabuf_map_dma_buf()
  *
- *      importer 从 sgt 里取 DMA 地址，配置给自己的硬件。
+ *      importer 从 DMA-mapped sgt 里取 sg_dma_address()/sg_dma_len()，
+ *      配置给自己的硬件。
  *
  *      用完：
  *      dma_buf_unmap_attachment()
@@ -89,7 +90,7 @@ struct simple_dmabuf_export_arg {
 	__s32 fd;
 };
 #define SIMPLE_DMABUF_IOC_MAGIC 'b'
-#define SIMPLE_DMABUF_IOC_EXPORT \
+#define SIMPLE_DMABUF_IOC_EXPORT                                               \
 	_IOWR(SIMPLE_DMABUF_IOC_MAGIC, 1, struct simple_dmabuf_export_arg)
 #define SIMPLE_DMABUF_IOC_DUMP _IO(SIMPLE_DMABUF_IOC_MAGIC, 2)
 
@@ -114,7 +115,6 @@ struct simple_dmabuf_export_arg {
  *   ptr = mmap(NULL, arg.size, PROT_READ | PROT_WRITE,
  *              MAP_SHARED, dmabuf_fd, 0);
  */
-
 
 struct simple_dmabuf_dev {
 	struct device *dev;
@@ -163,8 +163,8 @@ struct simple_dmabuf_buffer {
 };
 
 static const struct of_device_id simple_dmabuf_of_match[] = {
-	{ .compatible = "hjy,simple-dmabuf-exporter" },
-	{ }
+	{ .compatible = "hjy,dma_test" },
+	{}
 };
 MODULE_DEVICE_TABLE(of, simple_dmabuf_of_match);
 
@@ -178,11 +178,11 @@ static void simple_dmabuf_dump_buffer(struct simple_dmabuf_buffer *buf,
 
 	dump_size = min_t(size_t, buf->size, DUMP_SIZE);
 
-	dev_info(buf->dev, "%s: dump first %zu bytes, cpu=%p dma=%pad size=%zu\n",
-		 reason, dump_size, buf->cpu_addr, &buf->dma_addr, buf->size);
+	dev_info(buf->dev,
+		 "%s: dump first %zu bytes, cpu=%p dma=%pad size=%zu\n", reason,
+		 dump_size, buf->cpu_addr, &buf->dma_addr, buf->size);
 
-	print_hex_dump(KERN_INFO, "simple_dmabuf: ",
-		       DUMP_PREFIX_OFFSET, 16, 1,
+	print_hex_dump(KERN_INFO, "simple_dmabuf: ", DUMP_PREFIX_OFFSET, 16, 1,
 		       buf->cpu_addr, dump_size, true);
 }
 
@@ -201,8 +201,7 @@ static int simple_dmabuf_attach(struct dma_buf *dmabuf,
 {
 	struct simple_dmabuf_buffer *buf = dmabuf->priv;
 
-	dev_info(buf->dev, "attach: importer dev=%s\n",
-		 dev_name(attach->dev));
+	dev_info(buf->dev, "attach: importer dev=%s\n", dev_name(attach->dev));
 
 	return 0;
 }
@@ -217,8 +216,7 @@ static void simple_dmabuf_detach(struct dma_buf *dmabuf,
 {
 	struct simple_dmabuf_buffer *buf = dmabuf->priv;
 
-	dev_info(buf->dev, "detach: importer dev=%s\n",
-		 dev_name(attach->dev));
+	dev_info(buf->dev, "detach: importer dev=%s\n", dev_name(attach->dev));
 }
 
 /*
@@ -227,8 +225,17 @@ static void simple_dmabuf_detach(struct dma_buf *dmabuf,
  * importer 调用 dma_buf_map_attachment() 时进入这里。
  *
  * 这里要返回一个已经映射到 importer 设备地址空间的 sg_table。
- * 为了教学简单，我们把 coherent buffer 看成一段连续内存，构造 1 个
- * scatterlist entry。
+ *
+ * 注意两个阶段：
+ *
+ *   1. dma_get_sgtable_attrs()
+ *      从 exporter 的 backing storage 得到 sg_table。此时它主要描述
+ *      page/offset/length，也就是 buffer 背后有哪些内存页。
+ *
+ *   2. dma_map_sgtable()
+ *      把这张 sg_table 映射到 attach->dev 这个 importer 设备的 DMA
+ *      地址空间。成功后，importer 才能用 sg_dma_address() 和
+ *      sg_dma_len() 配置硬件。
  *
  * 注意：
  *   dma_mmap_coherent() 是给用户态 mmap 用的。
@@ -246,30 +253,16 @@ simple_dmabuf_map_dma_buf(struct dma_buf_attachment *attach,
 	if (!sgt)
 		return ERR_PTR(-ENOMEM);
 
-	ret = sg_alloc_table(sgt, 1, GFP_KERNEL);
-	if (ret)
+	ret = dma_get_sgtable_attrs(buf->dev, sgt, buf->cpu_addr, buf->dma_addr,
+				    buf->size, 0);
+	if (ret) {
+		dev_err(buf->dev, "dma_get_sgtable_attrs failed: %d\n", ret);
 		goto err_free_sgt;
+	}
 
 	/*
-	 * sg_table 是 exporter 交给 importer 的“这块 buffer 在 DMA
-	 * 世界里长什么样”的描述。
-	 *
-	 * 简化版只做 1 个 sg entry：
-	 *
-	 *   sgt->sgl
-	 *     page/offset/length  描述 backing page
-	 *     dma_address/dma_len 描述 importer 可用于 DMA 的地址和长度
-	 *
-	 * importer 驱动一般不会直接碰 buf->dma_addr，而是拿这里返回的
-	 * sg_table，再从 sg_dma_address(sg) 取地址配置给自己的硬件。
-	 */
-	sg_dma_address(sgt->sgl) = buf->dma_addr;
-	sg_dma_len(sgt->sgl) = buf->size;
-	sg_set_page(sgt->sgl, virt_to_page(buf->cpu_addr), buf->size, 0);
-
-	/*
-	 * 这一步把 sg_table 映射到 attach->dev 这个 importer 设备的
-	 * DMA 地址空间。
+	 * 这一步才把 sg_table 映射到 attach->dev 这个 importer 设备的
+	 * DMA 地址空间。不要在 map 之前手动填写 sg_dma_address()。
 	 *
 	 * 对没有 IOMMU、地址空间很直接的平台，你可能觉得 dma 地址
 	 * 没变化；但在有 IOMMU/SMMU 或 DMA mask 限制时，这一步非常关键。
@@ -279,14 +272,16 @@ simple_dmabuf_map_dma_buf(struct dma_buf_attachment *attach,
 	 *   DMA_FROM_DEVICE importer 设备写，之后 CPU/exporter 读
 	 *   DMA_BIDIRECTIONAL 双向
 	 */
-	ret = dma_map_sg_attrs(attach->dev, sgt->sgl, sgt->nents, direction, 0);
-	if (!ret) {
-		ret = -ENOMEM;
+	ret = dma_map_sgtable(attach->dev, sgt, direction, 0);
+	if (ret) {
+		dev_err(buf->dev,
+			"dma_map_sgtable failed for importer %s: %d\n",
+			dev_name(attach->dev), ret);
 		goto err_free_table;
 	}
 
 	dev_info(buf->dev, "map_dma_buf: importer dev=%s nents=%d dir=%d\n",
-		 dev_name(attach->dev), ret, direction);
+		 dev_name(attach->dev), sgt->nents, direction);
 
 	return sgt;
 
@@ -316,8 +311,11 @@ static void simple_dmabuf_unmap_dma_buf(struct dma_buf_attachment *attach,
 	 * 这和 streaming DMA 里的 dma_map_single/dma_unmap_single 是一组
 	 * 类似的生命周期概念，只是 dmabuf 这里以 attachment/sg_table
 	 * 为单位。
+	 *
+	 * dma_unmap_sgtable() 会用 sgt->orig_nents 做 unmap。sgt->nents 是
+	 * map 后给设备遍历的 DMA entry 数量，二者不要混用。
 	 */
-	dma_unmap_sg_attrs(attach->dev, sgt->sgl, sgt->nents, direction, 0);
+	dma_unmap_sgtable(attach->dev, sgt, direction, 0);
 	sg_free_table(sgt);
 	kfree(sgt);
 }
@@ -343,8 +341,8 @@ static int simple_dmabuf_mmap(struct dma_buf *dmabuf,
 	 * 用户态 mmap dmabuf fd 时，正常 offset 是 0。
 	 * 这里直接把 coherent buffer 映射给用户态。
 	 */
-	return dma_mmap_coherent(buf->dev, vma, buf->cpu_addr,
-				 buf->dma_addr, buf->size);
+	return dma_mmap_coherent(buf->dev, vma, buf->cpu_addr, buf->dma_addr,
+				 buf->size);
 }
 
 /*
@@ -432,8 +430,7 @@ static const struct dma_buf_ops simple_dmabuf_ops = {
 	.release = simple_dmabuf_release,
 };
 
-static int simple_dmabuf_export_one(struct simple_dmabuf_dev *sdev,
-				    size_t size)
+static int simple_dmabuf_export_one(struct simple_dmabuf_dev *sdev, size_t size)
 {
 	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
 	struct simple_dmabuf_buffer *buf;
@@ -468,8 +465,8 @@ static int simple_dmabuf_export_one(struct simple_dmabuf_dev *sdev,
 	 * 它适合教学和小块共享内存。视频大帧/生产链路通常会进一步看
 	 * CMA、dma-heap、vb2、ION 或者设备专用 allocator。
 	 */
-	buf->cpu_addr = dma_alloc_coherent(buf->dev, buf->size,
-					   &buf->dma_addr, GFP_KERNEL);
+	buf->cpu_addr = dma_alloc_coherent(buf->dev, buf->size, &buf->dma_addr,
+					   GFP_KERNEL);
 	if (!buf->cpu_addr) {
 		kfree(buf);
 		return -ENOMEM;
@@ -538,8 +535,7 @@ static int simple_dmabuf_export_one(struct simple_dmabuf_dev *sdev,
 	sdev->last_dmabuf = dmabuf;
 	mutex_unlock(&sdev->lock);
 
-	dev_info(sdev->dev,
-		 "export dmabuf: size=%zu fd=%d cpu=%p dma=%pad\n",
+	dev_info(sdev->dev, "export dmabuf: size=%zu fd=%d cpu=%p dma=%pad\n",
 		 buf->size, fd, buf->cpu_addr, &buf->dma_addr);
 
 	return fd;
@@ -641,7 +637,6 @@ static const struct file_operations simple_dmabuf_fops = {
 	.release = simple_dmabuf_release_file,
 	.unlocked_ioctl = simple_dmabuf_ioctl,
 };
-
 
 static int simple_dmabuf_probe(struct platform_device *pdev)
 {
